@@ -8,10 +8,10 @@ import {
 } from './types';
 import { DEFAULT_SETTINGS, BOARD_SIZES } from './constants';
 
-// Import utils
+// Import utils với placeHandicapStones
 import { 
   makeEmptyBoard, inBounds, tryPlay, generateStarPoints,
-  getGroupAndLiberties 
+  getGroupAndLiberties, placeHandicapStones
 } from './utils/board';
 import { pickAiMove } from './utils/ai';
 import { exportToSGF, importFromSGF } from './utils/sgf';
@@ -47,19 +47,28 @@ const GoGame: React.FC = () => {
   const [showTutorial, setShowTutorial] = useState(false);
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   
-  const koHistoryRef = useRef<StoneType[][] | null>(null);
+  // Refs
+  const boardHistoryRef = useRef<StoneType[][][]>([]);
   const aiMoveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  const boardHistoryRef = useRef<StoneType[][][]>([]);
 
   const getAIColor = useCallback((): StoneType => {
     return settings.humanColor === 'black' ? Stone.WHITE : Stone.BLACK;
   }, [settings.humanColor]);
 
   const initializeGame = useCallback(() => {
-    const newBoard = makeEmptyBoard(settings.boardSize);
+    let newBoard = makeEmptyBoard(settings.boardSize);
+    
+    // Đặt quân chấp nếu có (chỉ cho chế độ local)
+    if (settings.handicap > 0 && gameMode === 'local') {
+      const handicapPositions = placeHandicapStones(settings.boardSize, settings.handicap);
+      handicapPositions.forEach(pos => {
+        newBoard[pos.y][pos.x] = Stone.BLACK;
+      });
+    }
+    
     setBoard(newBoard);
-    setCurrentPlayer(Stone.BLACK);
+    setCurrentPlayer(settings.handicap > 0 ? Stone.WHITE : Stone.BLACK); // Trắng đi trước nếu có chấp
     setCaptures({ black: 0, white: 0 });
     setMoveHistory([]);
     setGameStatus('playing');
@@ -74,13 +83,15 @@ const GoGame: React.FC = () => {
       return now;
     });
     setIsTimerActive(true);
-    koHistoryRef.current = null;
-    boardHistoryRef.current = [];
+    boardHistoryRef.current = []; // Reset board history
     
-    if (gameMode === 'ai' && settings.humanColor === 'white') {
+    // AI đi trước nếu cần
+    if (gameMode === 'ai' && 
+        ((settings.handicap > 0 && settings.humanColor === 'black') || 
+         (settings.handicap === 0 && settings.humanColor === 'white'))) {
       setTimeout(() => handleAIMove(), 500);
     }
-  }, [settings.boardSize, settings.humanColor, settings.timePerMove, gameMode]);
+  }, [settings, gameMode]);
 
   const cleanup = useCallback(() => {
     if (aiMoveTimeoutRef.current) {
@@ -101,7 +112,8 @@ const GoGame: React.FC = () => {
     if (gameMode === 'ai' && currentPlayer === getAIColor()) {
       return false;
     }
-    const result = tryPlay(board, x, y, currentPlayer, koHistoryRef.current);
+    // Truyền board history thay vì ko board
+    const result = tryPlay(board, x, y, currentPlayer, boardHistoryRef.current);
     return result.legal;
   }, [board, gameStatus, currentPlayer, gameMode, getAIColor]);
 
@@ -193,7 +205,8 @@ const GoGame: React.FC = () => {
     setIsLoadingAI(true);
     aiMoveTimeoutRef.current = setTimeout(() => {
       try {
-        const aiMove = pickAiMove(board, currentPlayer, settings.difficulty, koHistoryRef.current);
+        // AI sử dụng board history
+        const aiMove = pickAiMove(board, currentPlayer, settings.difficulty, boardHistoryRef.current);
         setIsLoadingAI(false);
         
         if (aiMove && aiMove.x !== -1) {
@@ -212,11 +225,17 @@ const GoGame: React.FC = () => {
   const handlePlaceStone = useCallback((position: Position) => {
     if (!isValidMove(position) && !(gameMode === 'ai' && currentPlayer === getAIColor())) return;
     
-    const result = tryPlay(board, position.x, position.y, currentPlayer, koHistoryRef.current);
+    // Truyền board history thay vì ko board
+    const result = tryPlay(board, position.x, position.y, currentPlayer, boardHistoryRef.current);
     if (!result.legal || !result.board) return;
 
+    // Lưu board hiện tại vào history TRƯỚC khi update
     boardHistoryRef.current = [...boardHistoryRef.current, board];
-    koHistoryRef.current = result.captures === 1 ? board : null;
+    
+    // Giới hạn history để tránh memory leak (giữ 10 board gần nhất)
+    if (boardHistoryRef.current.length > 10) {
+      boardHistoryRef.current = boardHistoryRef.current.slice(-10);
+    }
     
     setBoard(result.board);
     setLastMove(position);
@@ -306,6 +325,7 @@ const GoGame: React.FC = () => {
     const newHistory = moveHistory.slice(0, -actualMovesToUndo);
     setMoveHistory(newHistory);
     
+    // Lấy board từ history
     const previousBoard = boardHistoryRef.current[boardHistoryRef.current.length - actualMovesToUndo] || 
                          makeEmptyBoard(settings.boardSize);
     setBoard(previousBoard);
@@ -323,12 +343,11 @@ const GoGame: React.FC = () => {
     
     setCurrentPlayer(newHistory.length > 0 ? 
       (newHistory[newHistory.length - 1].player === Stone.BLACK ? Stone.WHITE : Stone.BLACK) : 
-      Stone.BLACK);
+      (settings.handicap > 0 ? Stone.WHITE : Stone.BLACK));
     
     setPassCount(newHistory.slice(-2).filter(m => m.isPass).length);
     setGameStatus('playing');
     setShowScore(false);
-    koHistoryRef.current = null;
     boardHistoryRef.current = boardHistoryRef.current.slice(0, -actualMovesToUndo);
     
     setTimerExpiry(() => {
@@ -336,7 +355,7 @@ const GoGame: React.FC = () => {
       now.setSeconds(now.getSeconds() + settings.timePerMove);
       return now;
     });
-  }, [moveHistory, gameMode, settings.boardSize, settings.timePerMove]);
+  }, [moveHistory, gameMode, settings.boardSize, settings.timePerMove, settings.handicap]);
 
   const saveGame = useCallback(() => {
     try {
@@ -374,8 +393,8 @@ const GoGame: React.FC = () => {
         const newBoard = makeEmptyBoard(gameData.boardSize);
         let currentBoard = newBoard;
         let currentCaptures = { black: 0, white: 0 };
-        let koBoard: StoneType[][] | null = null;
         const newMoveHistory: GameMove[] = [];
+        boardHistoryRef.current = [];
         
         for (const move of gameData.moves) {
           if (move.position.x === -1 && move.position.y === -1) {
@@ -389,14 +408,14 @@ const GoGame: React.FC = () => {
             };
             newMoveHistory.push(passMove);
           } else {
-            const result = tryPlay(currentBoard, move.position.x, move.position.y, move.player, koBoard);
+            const result = tryPlay(currentBoard, move.position.x, move.position.y, move.player, boardHistoryRef.current);
             if (!result.legal || !result.board) continue;
             
+            boardHistoryRef.current.push(currentBoard);
             currentBoard = result.board;
             if (result.captures && result.captures > 0) {
               currentCaptures[move.player === Stone.BLACK ? 'black' : 'white'] += result.captures;
             }
-            koBoard = result.captures === 1 ? currentBoard : null;
             
             const gameMove: GameMove = {
               player: move.player,
@@ -406,7 +425,6 @@ const GoGame: React.FC = () => {
               boardState: produce(currentBoard, draft => draft)
             };
             newMoveHistory.push(gameMove);
-            boardHistoryRef.current.push(currentBoard);
           }
         }
         
@@ -422,7 +440,6 @@ const GoGame: React.FC = () => {
         setPassCount(newMoveHistory.slice(-2).filter(m => m.isPass).length);
         setGameStatus('playing');
         setShowScore(false);
-        koHistoryRef.current = koBoard;
         
         event.target.value = '';
       } catch (error) {
@@ -658,6 +675,12 @@ const GoGame: React.FC = () => {
                     <span className="text-gray-600">Pass liên tiếp:</span>
                     <span className="font-medium">{passCount}/2</span>
                   </div>
+                  {settings.handicap > 0 && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-600">Quân chấp:</span>
+                      <span className="font-medium">{settings.handicap} quân</span>
+                    </div>
+                  )}
                   <TimerDisplay
                     expiryTimestamp={timerExpiry}
                     onExpire={() => {
@@ -687,6 +710,33 @@ const GoGame: React.FC = () => {
                         <option key={size} value={size}>{size}x{size}</option>
                       ))}
                     </select>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm sm:text-base font-medium mb-1 text-gray-700">
+                      Quân chấp (Handicap):
+                    </label>
+                    <select
+                      value={settings.handicap}
+                      onChange={(e) => setSettings(prev => ({ ...prev, handicap: Number(e.target.value) }))}
+                      className="w-full p-2 text-sm sm:text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all"
+                      disabled={gameMode === 'ai'} // AI chưa hỗ trợ handicap
+                    >
+                      <option value="0">Không chấp</option>
+                      <option value="2">2 quân</option>
+                      <option value="3">3 quân</option>
+                      <option value="4">4 quân</option>
+                      <option value="5">5 quân</option>
+                      <option value="6">6 quân</option>
+                      <option value="7">7 quân</option>
+                      <option value="8">8 quân</option>
+                      <option value="9">9 quân</option>
+                    </select>
+                    {gameMode === 'ai' && settings.handicap > 0 && (
+                      <p className="text-xs text-red-500 mt-1">
+                        AI chưa hỗ trợ chơi với handicap
+                      </p>
+                    )}
                   </div>
                   
                   <div>
